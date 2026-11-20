@@ -18,6 +18,10 @@ xcrun lipo -create "$project/.build/QuotaRail-arm64" "$project/.build/QuotaRail-
 
 cp Scripts/Info.plist "$app/Contents/Info.plist"
 cp LICENSE "$app/Contents/Resources/LICENSE"
+iconset="$project/.build/QuotaRail.iconset"
+mkdir -p "$iconset"
+xcrun swift -module-cache-path "$cache" Scripts/render-icon.swift "$iconset"
+xcrun iconutil -c icns "$iconset" -o "$app/Contents/Resources/QuotaRail.icns"
 codesign --force --sign - "$app"
 codesign --verify --strict "$app"
 rm -f "$project/dist/QuotaRail-macOS.zip"
