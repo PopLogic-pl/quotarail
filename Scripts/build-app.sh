@@ -10,7 +10,7 @@ mkdir -p "$cache" "$app/Contents/MacOS" "$app/Contents/Resources"
 sdk="$(xcrun --sdk macosx --show-sdk-path)"
 for arch in arm64 x86_64; do
     xcrun swiftc -sdk "$sdk" -target "$arch-apple-macosx13.0" -swift-version 5 \
-        -module-cache-path "$cache" -parse-as-library -O Sources/QuotaRail/QuotaRail.swift \
+        -module-cache-path "$cache" -parse-as-library -O -lsqlite3 Sources/QuotaRail/*.swift \
         -o "$project/.build/QuotaRail-$arch"
 done
 xcrun lipo -create "$project/.build/QuotaRail-arm64" "$project/.build/QuotaRail-x86_64" \
@@ -18,6 +18,7 @@ xcrun lipo -create "$project/.build/QuotaRail-arm64" "$project/.build/QuotaRail-
 
 cp Scripts/Info.plist "$app/Contents/Info.plist"
 cp LICENSE "$app/Contents/Resources/LICENSE"
+ditto Resources "$app/Contents/Resources"
 iconset="$project/.build/QuotaRail.iconset"
 mkdir -p "$iconset"
 xcrun swift -module-cache-path "$cache" Scripts/render-icon.swift "$iconset"

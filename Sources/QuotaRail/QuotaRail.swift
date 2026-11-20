@@ -1,65 +1,73 @@
 import AppKit
 import SwiftUI
-
-// Use the property wrapper when building with Command Line Tools alone.
-private typealias ViewState<Value> = SwiftUI.State<Value>
+import Combine
+import Darwin
 
 @main
 struct QuotaRail {
     @MainActor
     static func main() {
-        let application = NSApplication.shared
-        application.setActivationPolicy(.accessory)
-        let menu = RailMenu()
-        application.delegate = menu
-        withExtendedLifetime(menu) { application.run() }
+        signal(SIGPIPE, SIG_IGN)
+        let args = CommandLine.arguments
+        if args.count == 3, args[1] == "--capture-claude", let id = UUID(uuidString: args[2]) {
+            if let data = try? captureInput(),
+               (try? Storage.captureClaude(id, data: data)) != nil {
+                print(tr("QuotaRail · Reading saved"))
+            }
+            return
+        }
+
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let delegate = MenuApp()
+        app.delegate = delegate
+        withExtendedLifetime(delegate) { app.run() }
     }
-}
 
-private struct RailItem: Identifiable {
-    let id: String
-    let name: String
-    let example: String
-
-    static let items = [
-        RailItem(id: "CC", name: "Claude Code", example: "91/99%"),
-        RailItem(id: "Cx", name: "OpenAI Codex", example: "63%"),
-        RailItem(id: "Cr", name: "Cursor", example: "87/48%"),
-        RailItem(id: "Ag", name: "Antigravity", example: "100/96%"),
-        RailItem(id: "CW", name: "Claude Code · drugie konto", example: "72/18%"),
-        RailItem(id: "Cop", name: "GitHub Copilot", example: "94%")
-    ]
-
-    func value(examples: Bool) -> String { examples ? example : "–" }
+    private static func captureInput() throws -> Data {
+        var result = Data()
+        while let chunk = try FileHandle.standardInput.read(upToCount: 16_384), !chunk.isEmpty {
+            result.append(chunk)
+            guard result.count <= 1_048_576 else { throw ReadError.noQuota }
+        }
+        return result
+    }
 }
 
 @MainActor
-private final class RailMenu: NSObject, NSApplicationDelegate {
-    private let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+private final class MenuApp: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+    let store = Store()
     private let popover = NSPopover()
+    private let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private var updates: AnyCancellable?
+    private var timer: Timer?
+    private var nextRefresh = Date()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         status.autosaveName = "quotarail"
-        status.button?.target = self
-        status.button?.action = #selector(togglePanel)
-
+        let panel = Panel(store: store) { NSApp.terminate(nil) }
+        popover.contentViewController = NSHostingController(rootView: panel)
+        popover.contentSize = NSSize(width: PanelLayout.width, height: PanelLayout.height)
         popover.behavior = .transient
         popover.appearance = NSAppearance(named: .darkAqua)
-        let controller = NSHostingController(rootView: RailPanel { [weak self] examples in
-            self?.updateReadout(examples: examples)
-        })
-        popover.contentViewController = controller
-        popover.contentSize = controller.view.fittingSize
-        updateReadout(examples: false)
-    }
-
-    @objc private func togglePanel() {
-        guard let button = status.button else { return }
-        if popover.isShown {
-            popover.performClose(nil)
-        } else {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
+        popover.delegate = self
+        popover.animates = false
+        if let button = status.button {
+            button.target = self
+            button.action = #selector(togglePanel)
+            button.imagePosition = .noImage
+        }
+        updates = store.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] in self?.updateTitle() }
+        updateTitle()
+        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+        tick()
+        if !UserDefaults.standard.bool(forKey: "openedFirstRun") {
+            UserDefaults.standard.set(true, forKey: "openedFirstRun")
+            togglePanel()
         }
     }
 
@@ -68,84 +76,61 @@ private final class RailMenu: NSObject, NSApplicationDelegate {
         return false
     }
 
-    private func updateReadout(examples: Bool) {
-        let bracket: [NSAttributedString.Key: Any] = [
-            .foregroundColor: NSColor.systemRed,
-            .font: NSFont.systemFont(ofSize: 14, weight: .bold)
-        ]
-        let label = NSFont.systemFont(ofSize: 10.5, weight: .medium)
-        let number = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
-        let title = NSMutableAttributedString(string: "⟦ ", attributes: bracket)
+    func popoverShouldClose(_ popover: NSPopover) -> Bool {
+        NSApp.modalWindow == nil
+    }
 
-        for (index, item) in RailItem.items.enumerated() {
+    @objc private func togglePanel() {
+        guard let button = status.button else { return }
+        if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            store.tick()
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+        }
+    }
+
+    private func tick() {
+        store.tick()
+        guard !store.accounts.isEmpty, Date() >= nextRefresh else { return }
+        nextRefresh = Date().addingTimeInterval(180)
+        Task { await store.refresh() }
+    }
+
+    private func updateTitle() {
+        guard let button = status.button else { return }
+        let title = NSMutableAttributedString(string: "")
+        let small = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+        let figures = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
+        let bracket: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 14, weight: .bold), .foregroundColor: NSColor.systemRed
+        ]
+        title.append(NSAttributedString(string: "⟦ ", attributes: bracket))
+        var descriptions: [String] = []
+        let accounts = store.pinned
+        if accounts.isEmpty {
+            title.append(NSAttributedString(string: tr("Agents"), attributes: [.font: small]))
+        }
+        for (index, account) in accounts.enumerated() {
+            let quotas = store.freshQuotas(account)
+            let value = MenuBarReadout.value(for: account, quotas: quotas)
             if index > 0 {
                 title.append(NSAttributedString(string: " · ", attributes: [
-                    .font: label, .foregroundColor: NSColor.secondaryLabelColor
+                    .font: small, .foregroundColor: NSColor.secondaryLabelColor
                 ]))
             }
-            title.append(NSAttributedString(string: item.id + " ", attributes: [.font: label]))
-            title.append(NSAttributedString(string: item.value(examples: examples), attributes: [.font: number]))
+            title.append(NSAttributedString(string: account.abbreviation + " ", attributes: [.font: small]))
+            title.append(NSAttributedString(string: value, attributes: [.font: figures]))
+            let identity = account.provider.name + ", " + account.name
+            let detail = quotas.map { tr("%@: %@ remaining", $0.title, $0.value) }.joined(separator: ", ")
+            descriptions.append(identity + (detail.isEmpty ? ", " + (store.errors[account.id] ?? tr("No reading")) : ", " + detail))
         }
         title.append(NSAttributedString(string: " ⟧", attributes: bracket))
-        status.button?.attributedTitle = title
-        status.button?.setAccessibilityLabel(examples ? "QuotaRail, dane przykładowe" : "QuotaRail, pusty podgląd")
-        status.button?.toolTip = "QuotaRail · podgląd paska limitów"
-    }
-}
-
-private struct RailPanel: View {
-    @ViewState private var examples = false
-    let updateReadout: (Bool) -> Void
-
-    private let background = Color(red: 0.060, green: 0.076, blue: 0.089)
-    private let surface = Color(red: 0.094, green: 0.114, blue: 0.131)
-    private let mint = Color(red: 0.495, green: 0.904, blue: 0.781)
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                Text("QuotaRail")
-                    .font(.system(size: 25, weight: .bold))
-                Spacer()
-                Button {
-                    NSApplication.shared.terminate(nil)
-                } label: {
-                    Image(systemName: "power")
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Zakończ QuotaRail")
-                .help("Zakończ QuotaRail")
-            }
-
-            Toggle("Pokaż przykładowe limity", isOn: $examples)
-                .toggleStyle(.switch)
-                .tint(mint)
-                .onChange(of: examples, perform: updateReadout)
-
-            VStack(spacing: 8) {
-                ForEach(RailItem.items) { item in
-                    HStack(spacing: 11) {
-                        Text(item.id)
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 32, alignment: .leading)
-                        Text(item.name)
-                            .font(.system(size: 12, weight: .semibold))
-                        Spacer()
-                        Text(item.value(examples: examples))
-                            .font(.system(size: 18, weight: .semibold).monospacedDigit())
-                            .foregroundStyle(examples ? mint : Color.secondary)
-                    }
-                    .padding(.horizontal, 13)
-                    .frame(height: 44)
-                    .background(surface, in: RoundedRectangle(cornerRadius: 9))
-                    .accessibilityElement(children: .combine)
-                }
-            }
+        if !button.attributedTitle.isEqual(to: title) {
+            button.attributedTitle = title
         }
-        .padding(21)
-        .frame(width: 390)
-        .background(background)
-        .environment(\.colorScheme, .dark)
+        button.toolTip = descriptions.isEmpty ? tr("Agent limits") : descriptions.joined(separator: "\n")
+        button.setAccessibilityLabel(descriptions.isEmpty ? tr("Agent limits") : descriptions.joined(separator: ". "))
     }
 }
